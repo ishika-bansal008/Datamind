@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import html
 import json
+import math
+import re
+from io import BytesIO
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -9,6 +12,7 @@ from uuid import uuid4
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from PIL import Image, ImageDraw, ImageFont
 
 
 # ============================================================================
@@ -605,8 +609,497 @@ def build_result_markdown(result: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+
+# ============================================================================
+# VISUAL OUTPUT ENGINE
+# Converts the API's structured text / cards / tables / Mermaid into real PNGs.
+# This is a local renderer: it does not depend on a separate image-generation API.
+# ============================================================================
+
+VISUAL_PALETTES = {
+    "professional": {
+        "bg": "#0B1120", "panel": "#121E34", "panel2": "#182844",
+        "line": "#53658B", "text": "#F1F4FF", "muted": "#A8B7D2",
+        "accent": "#9296FF", "accent2": "#5BD5B8", "warm": "#F3BE7A",
+        "soft": "#202F4E", "white": "#FFFFFF",
+    },
+    "minimal": {
+        "bg": "#F4F6FA", "panel": "#FFFFFF", "panel2": "#EAF0F8",
+        "line": "#C8D2E2", "text": "#172238", "muted": "#53627A",
+        "accent": "#4D63B8", "accent2": "#178C78", "warm": "#BA782E",
+        "soft": "#E8EDF5", "white": "#FFFFFF",
+    },
+    "colorful": {
+        "bg": "#10172B", "panel": "#1B2743", "panel2": "#25375B",
+        "line": "#6678A6", "text": "#F7F8FF", "muted": "#C0CBE2",
+        "accent": "#A78BFA", "accent2": "#4DD8C0", "warm": "#FFBD75",
+        "soft": "#303E62", "white": "#FFFFFF",
+    },
+}
+
+
+def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Load a broadly available font; Pillow's default is the final fallback."""
+    candidates = []
+    if bold:
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        ])
+    else:
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ])
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except OSError:
+            pass
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _clean_text(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"[`*_>#]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: Any, max_width: int) -> list[str]:
+    text = _clean_text(text)
+    if not text:
+        return []
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        try:
+            width = draw.textbbox((0, 0), candidate, font=font)[2]
+        except Exception:
+            width = len(candidate) * 9
+        if width <= max_width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _draw_wrapped(
+    draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font: Any,
+    fill: str, max_width: int, line_gap: int = 8, max_lines: int | None = None,
+) -> int:
+    x, y = xy
+    lines = _wrap_text(draw, text, font, max_width)
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        if lines:
+            lines[-1] = lines[-1].rstrip(" .") + "…"
+    for line in lines:
+        draw.text((x, y), line, font=font, fill=fill)
+        bbox = draw.textbbox((x, y), line, font=font)
+        y += (bbox[3] - bbox[1]) + line_gap
+    return y
+
+
+def _new_visual(title: str, fmt_label: str, palette: dict[str, str], height: int = 1100) -> tuple[Image.Image, ImageDraw.ImageDraw]:
+    width = 1600
+    height = max(850, min(4200, int(height)))
+    image = Image.new("RGB", (width, height), palette["bg"])
+    draw = ImageDraw.Draw(image)
+    # subtle top accent and large workspace panel
+    draw.rounded_rectangle((38, 34, width - 38, height - 34), radius=34, fill=palette["panel"], outline=palette["line"], width=2)
+    draw.rounded_rectangle((38, 34, width - 38, 52), radius=8, fill=palette["accent"])
+    draw.text((92, 83), "DATAMIND  /  VISUAL KNOWLEDGE", font=_font(23, True), fill=palette["accent"])
+    heading = _clean_text(title)[:110] or "Your transformation"
+    title_font = _font(48, True)
+    while len(heading) > 18 and draw.textbbox((0, 0), heading, font=title_font)[2] > 1410:
+        current_size = getattr(title_font, "size", 48)
+        if current_size <= 30:
+            break
+        title_font = _font(current_size - 2, True)
+    draw.text((92, 137), heading, font=title_font, fill=palette["text"])
+    draw.text((94, 207), fmt_label.upper() + "  •  GENERATED FROM YOUR SOURCE", font=_font(18, True), fill=palette["muted"])
+    return image, draw
+
+
+def _extract_visual_items(result: dict[str, Any]) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    cards = result.get("cards")
+    if isinstance(cards, list):
+        for index, card in enumerate(cards):
+            if isinstance(card, dict):
+                title = _clean_text(card.get("title") or card.get("question") or card.get("label") or f"Key idea {index + 1}")
+                body = _clean_text(card.get("body") or card.get("description") or card.get("content") or card.get("answer") or "")
+                if title or body:
+                    items.append({"title": title[:110], "body": body[:500]})
+            elif card:
+                items.append({"title": f"Key idea {index + 1}", "body": _clean_text(card)[:500]})
+
+    # Prefer clearly structured sections and lists from the model's markdown.
+    content = str(result.get("content") or "")
+    sections: list[dict[str, str]] = []
+    current_title = "Overview"
+    current_lines: list[str] = []
+
+    def flush_section() -> None:
+        nonlocal current_lines, current_title
+        text = _clean_text(" ".join(current_lines))
+        if text:
+            sections.append({"title": current_title[:110], "body": text[:650]})
+        current_lines = []
+
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        heading = re.match(r"^#{1,6}\s+(.+)$", line)
+        if heading:
+            flush_section()
+            current_title = _clean_text(heading.group(1)) or "Section"
+            continue
+        line = re.sub(r"^[-*+]\s+", "", line)
+        line = re.sub(r"^\d+[.)]\s+", "", line)
+        line = re.sub(r"^\*\*(.+?)\*\*\s*[:—-]\s*", r"\1: ", line)
+        cleaned = _clean_text(line)
+        if cleaned:
+            current_lines.append(cleaned)
+            # Split very long sections so visual cards stay legible.
+            if sum(len(x) for x in current_lines) > 620:
+                flush_section()
+                current_title = "Continued"
+    flush_section()
+
+    if not items:
+        items = sections
+    elif len(items) < 3 and sections:
+        seen = {x["title"].lower() for x in items}
+        for section in sections:
+            if section["title"].lower() not in seen:
+                items.append(section)
+                seen.add(section["title"].lower())
+            if len(items) >= 10:
+                break
+
+    if not items:
+        important = result.get("important_lines") or []
+        if isinstance(important, list):
+            items = [{"title": f"Key point {i + 1}", "body": _clean_text(line)[:500]} for i, line in enumerate(important) if _clean_text(line)]
+
+    if not items:
+        words = result.get("important_words") or []
+        if isinstance(words, list) and words:
+            items = [{"title": str(word), "body": "Important concept identified in the source."} for word in words[:10]]
+
+    if not items:
+        source = _clean_text(result.get("source_text") or result.get("content") or "No structured details were returned.")
+        sentences = re.split(r"(?<=[.!?])\s+", source)
+        items = [{"title": f"Key idea {i + 1}", "body": sentence[:500]} for i, sentence in enumerate(sentences[:8]) if sentence]
+
+    return items[:12]
+
+
+def _extract_flow_nodes(result: dict[str, Any], items: list[dict[str, str]]) -> list[dict[str, str]]:
+    mermaid = str(result.get("mermaid") or "")
+    nodes: list[dict[str, str]] = []
+    # Read common Mermaid flowchart node syntax: A[Label] --> B[Label].
+    matches = re.findall(r"[A-Za-z0-9_]+\s*[\[({]([^\]})]+)[\])}]", mermaid)
+    for index, label in enumerate(matches):
+        label = _clean_text(label.strip('"\''))
+        if label and all(node["title"].lower() != label.lower() for node in nodes):
+            matched_item = next(
+                (item for item in items if item["title"].lower() == label.lower()),
+                items[index] if index < len(items) else None,
+            )
+            nodes.append({
+                "title": label[:100],
+                "body": (matched_item.get("body", "")[:220] if matched_item else ""),
+            })
+    if len(nodes) >= 2:
+        return nodes[:9]
+    step_items = []
+    for item in items:
+        title = item["title"]
+        if re.search(r"step|stage|phase|process|collect|prepare|train|evaluate|predict|improve", title, re.I):
+            step_items.append(item)
+    return (step_items or items)[:9]
+
+
+def _rounded_card(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], palette: dict[str, str], accent: str | None = None, radius: int = 24) -> None:
+    draw.rounded_rectangle(box, radius=radius, fill=palette["panel2"], outline=accent or palette["line"], width=2)
+    if accent:
+        draw.rounded_rectangle((box[0], box[1], box[0] + 12, box[3]), radius=6, fill=accent)
+
+
+def _draw_flowchart(title: str, fmt: str, items: list[dict[str, str]], palette: dict[str, str]) -> Image.Image:
+    nodes = items[:8]
+    height = 360 + len(nodes) * 175
+    image, draw = _new_visual(title, fmt, palette, height)
+    x1, x2 = 200, 1400
+    node_h = 112
+    start_y = 285
+    for index, item in enumerate(nodes):
+        y = start_y + index * 155
+        if index:
+            cx = 800
+            draw.line((cx, y - 43, cx, y - 13), fill=palette["accent2"], width=6)
+            draw.polygon([(cx - 12, y - 20), (cx + 12, y - 20), (cx, y - 5)], fill=palette["accent2"])
+        accent = palette["accent"] if index % 2 == 0 else palette["accent2"]
+        _rounded_card(draw, (x1, y, x2, y + node_h), palette, accent)
+        draw.ellipse((x1 + 25, y + 27, x1 + 82, y + 84), fill=accent)
+        num = str(index + 1)
+        draw.text((x1 + 44, y + 38), num, font=_font(23, True), fill="#10172A", anchor="mm")
+        draw.text((x1 + 110, y + 19), item["title"][:85], font=_font(25, True), fill=palette["text"])
+        if item.get("body"):
+            _draw_wrapped(draw, (x1 + 110, y + 58), item["body"], _font(17), palette["muted"], 1000, 5, 2)
+    draw.text((92, image.height - 85), f"{len(nodes)} stages  •  Follow the sequence from top to bottom", font=_font(18), fill=palette["muted"])
+    return image
+
+
+def _draw_mindmap(title: str, fmt: str, items: list[dict[str, str]], palette: dict[str, str]) -> Image.Image:
+    nodes = items[:8]
+    image, draw = _new_visual(title, fmt, palette, 1250)
+    cx, cy = 800, 690
+    radius_x, radius_y = 545, 365
+    positions = []
+    for i in range(len(nodes)):
+        angle = -math.pi / 2 + (2 * math.pi * i / max(1, len(nodes)))
+        px = int(cx + radius_x * math.cos(angle))
+        py = int(cy + radius_y * math.sin(angle))
+        positions.append((px, py))
+        draw.line((cx, cy, px, py), fill=palette["line"], width=7)
+    # Center topic node
+    draw.rounded_rectangle((cx - 245, cy - 92, cx + 245, cy + 92), radius=38, fill=palette["accent"], outline=palette["white"], width=2)
+    _draw_wrapped(draw, (cx - 200, cy - 34), title[:70], _font(30, True), "#10172A", 400, 5, 3)
+    accents = [palette["accent2"], palette["warm"], palette["accent"], "#80B9FF"]
+    for i, (item, (px, py)) in enumerate(zip(nodes, positions)):
+        w, h = 360, 150
+        box = (px - w // 2, py - h // 2, px + w // 2, py + h // 2)
+        accent = accents[i % len(accents)]
+        _rounded_card(draw, box, palette, accent)
+        _draw_wrapped(draw, (box[0] + 24, box[1] + 20), item["title"], _font(22, True), palette["text"], w - 48, 5, 2)
+        if item.get("body"):
+            _draw_wrapped(draw, (box[0] + 24, box[1] + 69), item["body"], _font(15), palette["muted"], w - 48, 4, 3)
+    draw.text((92, image.height - 85), "Central idea connected to related concepts", font=_font(18), fill=palette["muted"])
+    return image
+
+
+def _draw_timeline(title: str, fmt: str, items: list[dict[str, str]], palette: dict[str, str]) -> Image.Image:
+    nodes = items[:10]
+    height = 340 + len(nodes) * 165
+    image, draw = _new_visual(title, fmt, palette, height)
+    x_line = 220
+    top = 300
+    draw.line((x_line, top + 20, x_line, top + (len(nodes) - 1) * 145 + 100), fill=palette["accent"], width=8)
+    for i, item in enumerate(nodes):
+        y = top + i * 145
+        accent = palette["accent2"] if i % 2 else palette["accent"]
+        draw.ellipse((x_line - 20, y + 22, x_line + 20, y + 62), fill=accent, outline=palette["white"], width=2)
+        _rounded_card(draw, (300, y, 1390, y + 112), palette, accent)
+        date_match = re.search(r"\b(\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b", item["title"], re.I)
+        label = date_match.group(0) if date_match else f"MILESTONE {i + 1:02d}"
+        draw.text((330, y + 17), label.upper(), font=_font(15, True), fill=accent)
+        draw.text((550, y + 15), item["title"][:62], font=_font(22, True), fill=palette["text"])
+        if item.get("body"):
+            _draw_wrapped(draw, (550, y + 54), item["body"], _font(15), palette["muted"], 780, 4, 2)
+    return image
+
+
+def _draw_comparison(title: str, fmt: str, result: dict[str, Any], items: list[dict[str, str]], palette: dict[str, str]) -> Image.Image:
+    table = result.get("table") if isinstance(result.get("table"), dict) else {}
+    headers = table.get("headers") if isinstance(table.get("headers"), list) else []
+    rows = table.get("rows") if isinstance(table.get("rows"), list) else []
+    if not headers or not rows:
+        headers = ["Concept", "Explanation"]
+        rows = [[it["title"], it.get("body", "")] for it in items[:8]]
+    headers = [str(h) for h in headers[:4]]
+    rows = [r if isinstance(r, list) else [str(r)] for r in rows[:10]]
+    cols = max(1, len(headers))
+    height = 350 + (len(rows) + 1) * 125
+    image, draw = _new_visual(title, fmt, palette, height)
+    left, right, top = 90, 1510, 285
+    usable = right - left
+    col_w = usable // cols
+    draw.rounded_rectangle((left, top, right, top + 94), radius=18, fill=palette["accent"])
+    for c, header in enumerate(headers):
+        x = left + c * col_w + 19
+        _draw_wrapped(draw, (x, top + 29), header, _font(20, True), "#10172A", col_w - 36, 4, 2)
+    y = top + 104
+    for ri, row in enumerate(rows):
+        draw.rounded_rectangle((left, y, right, y + 112), radius=15, fill=palette["panel2"] if ri % 2 == 0 else palette["soft"], outline=palette["line"], width=1)
+        for c in range(cols):
+            value = str(row[c]) if c < len(row) else ""
+            x = left + c * col_w + 19
+            _draw_wrapped(draw, (x, y + 19), value, _font(17, c == 0), palette["text"] if c == 0 else palette["muted"], col_w - 36, 5, 4)
+        y += 121
+    return image
+
+
+def _draw_flashcards(title: str, fmt: str, items: list[dict[str, str]], palette: dict[str, str]) -> Image.Image:
+    nodes = items[:10]
+    rows = math.ceil(len(nodes) / 2)
+    height = 320 + rows * 320
+    image, draw = _new_visual(title, fmt, palette, height)
+    gap, card_w, card_h = 36, 690, 270
+    for i, item in enumerate(nodes):
+        col, row = i % 2, i // 2
+        x = 92 + col * (card_w + gap)
+        y = 285 + row * 310
+        accent = palette["accent"] if i % 2 == 0 else palette["accent2"]
+        _rounded_card(draw, (x, y, x + card_w, y + card_h), palette, accent)
+        draw.text((x + 28, y + 22), f"FLASHCARD  {i + 1:02d}", font=_font(15, True), fill=accent)
+        question = item["title"]
+        answer = item.get("body") or "Review this key concept from your source material."
+        _draw_wrapped(draw, (x + 28, y + 62), question, _font(25, True), palette["text"], card_w - 56, 6, 3)
+        draw.line((x + 28, y + 145, x + card_w - 28, y + 145), fill=palette["line"], width=2)
+        _draw_wrapped(draw, (x + 28, y + 166), answer, _font(17), palette["muted"], card_w - 56, 5, 5)
+    return image
+
+
+def _draw_infographic(title: str, fmt: str, result: dict[str, Any], items: list[dict[str, str]], palette: dict[str, str]) -> Image.Image:
+    nodes = items[:9]
+    rows = math.ceil(len(nodes) / 3)
+    height = 390 + rows * 270 + 120
+    image, draw = _new_visual(title, fmt, palette, height)
+    # Summary banner
+    summary = _clean_text(result.get("summary") or (nodes[0]["body"] if nodes else "A visual overview of the key ideas."))
+    draw.rounded_rectangle((92, 280, 1508, 405), radius=22, fill=palette["soft"], outline=palette["line"], width=2)
+    _draw_wrapped(draw, (125, 309), summary, _font(20, True), palette["text"], 1340, 7, 3)
+    colors = [palette["accent"], palette["accent2"], palette["warm"]]
+    card_w, card_h, gap_x, gap_y = 440, 220, 30, 28
+    for i, item in enumerate(nodes):
+        col, row = i % 3, i // 3
+        x = 92 + col * (card_w + gap_x)
+        y = 445 + row * (card_h + gap_y)
+        accent = colors[i % len(colors)]
+        _rounded_card(draw, (x, y, x + card_w, y + card_h), palette, accent)
+        draw.ellipse((x + 24, y + 22, x + 76, y + 74), fill=accent)
+        draw.text((x + 50, y + 48), str(i + 1), font=_font(19, True), fill="#10172A", anchor="mm")
+        _draw_wrapped(draw, (x + 95, y + 27), item["title"], _font(21, True), palette["text"], card_w - 120, 4, 2)
+        if item.get("body"):
+            _draw_wrapped(draw, (x + 26, y + 100), item["body"], _font(16), palette["muted"], card_w - 52, 5, 5)
+    return image
+
+
+def _draw_editorial(title: str, fmt: str, items: list[dict[str, str]], palette: dict[str, str]) -> Image.Image:
+    nodes = items[:10]
+    rows = math.ceil(len(nodes) / 2)
+    height = 330 + rows * 235 + 80
+    image, draw = _new_visual(title, fmt, palette, height)
+    for i, item in enumerate(nodes):
+        col, row = i % 2, i // 2
+        x = 92 + col * 720
+        y = 285 + row * 220
+        accent = palette["accent"] if i % 2 == 0 else palette["accent2"]
+        _rounded_card(draw, (x, y, x + 680, y + 188), palette, accent)
+        draw.text((x + 28, y + 20), f"SECTION {i + 1:02d}", font=_font(14, True), fill=accent)
+        _draw_wrapped(draw, (x + 28, y + 53), item["title"], _font(23, True), palette["text"], 620, 5, 2)
+        if item.get("body"):
+            _draw_wrapped(draw, (x + 28, y + 100), item["body"], _font(16), palette["muted"], 620, 5, 4)
+    return image
+
+
+
+
+def _draw_presentation(title: str, fmt: str, items: list[dict[str, str]], palette: dict[str, str]) -> Image.Image:
+    nodes = items[:8]
+    rows = math.ceil(len(nodes) / 2)
+    height = 350 + rows * 330
+    image, draw = _new_visual(title, fmt, palette, height)
+    slide_w, slide_h = 680, 285
+    for i, item in enumerate(nodes):
+        col, row = i % 2, i // 2
+        x, y = 92 + col * 720, 285 + row * 310
+        accent = palette["accent"] if i % 2 == 0 else palette["accent2"]
+        draw.rounded_rectangle((x, y, x + slide_w, y + slide_h), radius=20, fill=palette["panel2"], outline=palette["line"], width=2)
+        draw.rounded_rectangle((x, y, x + slide_w, y + 16), radius=8, fill=accent)
+        draw.text((x + 25, y + 38), f"SLIDE {i + 1:02d}", font=_font(15, True), fill=accent)
+        _draw_wrapped(draw, (x + 25, y + 82), item["title"], _font(27, True), palette["text"], slide_w - 50, 6, 2)
+        if item.get("body"):
+            _draw_wrapped(draw, (x + 25, y + 150), item["body"], _font(17), palette["muted"], slide_w - 50, 5, 4)
+        draw.text((x + slide_w - 30, y + slide_h - 33), "DATAMIND", font=_font(11, True), fill=palette["muted"], anchor="ra")
+    return image
+
+
+def _draw_summary(title: str, fmt: str, result: dict[str, Any], items: list[dict[str, str]], palette: dict[str, str]) -> Image.Image:
+    nodes = items[:6]
+    image, draw = _new_visual(title, fmt, palette, 1120)
+    summary = _clean_text(result.get("summary") or (nodes[0]["body"] if nodes else "A concise overview of the source information."))
+    draw.rounded_rectangle((92, 282, 1508, 490), radius=26, fill=palette["soft"], outline=palette["line"], width=2)
+    draw.text((128, 312), "THE BIG PICTURE", font=_font(17, True), fill=palette["accent"])
+    _draw_wrapped(draw, (128, 357), summary, _font(24, True), palette["text"], 1330, 8, 4)
+    draw.text((94, 535), "KEY TAKEAWAYS", font=_font(17, True), fill=palette["accent2"])
+    for i, item in enumerate(nodes):
+        row = i // 2
+        col = i % 2
+        x = 92 + col * 720
+        y = 585 + row * 145
+        accent = palette["accent"] if i % 2 == 0 else palette["accent2"]
+        _rounded_card(draw, (x, y, x + 680, y + 118), palette, accent)
+        draw.ellipse((x + 20, y + 32, x + 64, y + 76), fill=accent)
+        draw.text((x + 42, y + 54), str(i + 1), font=_font(17, True), fill="#10172A", anchor="mm")
+        _draw_wrapped(draw, (x + 85, y + 18), item["title"], _font(19, True), palette["text"], 560, 4, 2)
+        if item.get("body"):
+            _draw_wrapped(draw, (x + 85, y + 56), item["body"], _font(14), palette["muted"], 560, 4, 2)
+    return image
+
+
+def build_visual_png(result: dict[str, Any], requested_format: str | None = None, visual_style: str = "professional") -> bytes:
+    """Build a real PNG visual for every DataMind output format."""
+    fmt = str(requested_format or result.get("format") or "structured_notes").lower().replace(" ", "_")
+    # Resolve friendly names and backend aliases.
+    aliases = {
+        "mind_map": "mindmap", "structured_notes": "structured_notes",
+        "step_by_step_guide": "step_by_step", "smart_summary": "summary",
+        "comparison_table": "comparison_table", "mermaid_diagram": "mermaid",
+    }
+    fmt = aliases.get(fmt, fmt)
+    label = next((name for name, data in FORMATS.items() if data["id"] == fmt), fmt.replace("_", " ").title())
+    title = str(result.get("title") or label or "DataMind Visual")
+    palette = VISUAL_PALETTES.get(visual_style, VISUAL_PALETTES["professional"])
+    items = _extract_visual_items(result)
+
+    if fmt in {"flowchart", "workflow", "mermaid"}:
+        image = _draw_flowchart(title, label, _extract_flow_nodes(result, items), palette)
+    elif fmt in {"mindmap", "mind_map"}:
+        image = _draw_mindmap(title, label, items, palette)
+    elif fmt == "timeline":
+        image = _draw_timeline(title, label, items, palette)
+    elif fmt == "comparison_table":
+        image = _draw_comparison(title, label, result, items, palette)
+    elif fmt == "flashcards":
+        image = _draw_flashcards(title, label, items, palette)
+    elif fmt == "infographic":
+        image = _draw_infographic(title, label, result, items, palette)
+    elif fmt in {"step_by_step", "step-by-step"}:
+        image = _draw_flowchart(title, label, items, palette)
+    elif fmt == "presentation":
+        image = _draw_presentation(title, label, items, palette)
+    elif fmt == "summary":
+        image = _draw_summary(title, label, result, items, palette)
+    else:
+        # Structured notes and any future formats receive an editorial board.
+        image = _draw_editorial(title, label, items, palette)
+
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
 def render_result(result: dict[str, Any]) -> None:
-    fmt = str(result.get("format") or "transformation")
+    selected_options_for_result = st.session_state.get("last_options") or {}
+    fmt = str(selected_options_for_result.get("format") or result.get("format") or "transformation")
     label = next(
         (name for name, value in FORMATS.items() if value["id"] == fmt),
         fmt.replace("_", " ").title(),
@@ -643,6 +1136,9 @@ def render_result(result: dict[str, Any]) -> None:
         )
         st.markdown(f"<div style='margin:9px 0 14px'>{tags}</div>", unsafe_allow_html=True)
 
+    visual_result = dict(result)
+    visual_result.setdefault("source_text", st.session_state.get("last_source_text", ""))
+
     overview_tab, visual_tab, source_tab, raw_tab = st.tabs(
         ["✦  Overview", "▧  Visual output", "◫  Source & coverage", "{}  Raw data"]
     )
@@ -655,26 +1151,44 @@ def render_result(result: dict[str, Any]) -> None:
                     st.markdown(f"- {line}")
 
     with visual_tab:
+        selected_options = st.session_state.get("last_options") or {}
+        selected_visual_style = selected_options.get("visual_style", "professional")
+        selected_format = selected_options.get("format") or fmt
+        try:
+            visual_png = build_visual_png(visual_result, selected_format, selected_visual_style)
+            st.markdown("#### Your generated visual")
+            st.caption("DataMind has converted the AI result into a format-specific image. Preview it here and download the full-resolution PNG.")
+            st.image(visual_png, use_container_width=True)
+            slug = re.sub(r"[^a-z0-9]+", "-", str(result.get("title") or label).lower()).strip("-")[:48] or "visual"
+            st.download_button(
+                "↓  Download visual as PNG",
+                data=visual_png,
+                file_name=f"datamind-{slug}.png",
+                mime="image/png",
+                type="primary",
+                use_container_width=True,
+                key="download_visual_png",
+            )
+        except Exception as exc:
+            st.error(f"Could not create the visual image: {exc}")
+
         mermaid = result.get("mermaid")
         if mermaid:
-            st.markdown("#### Diagram preview")
-            components.html(mermaid_html(str(mermaid)), height=420, scrolling=True)
-            with st.expander("View / copy Mermaid source"):
+            with st.expander("Interactive Mermaid preview and source"):
+                components.html(mermaid_html(str(mermaid)), height=420, scrolling=True)
                 st.code(str(mermaid), language="mermaid")
                 st.download_button(
-                    "Download Mermaid source", str(mermaid),
+                    "Download editable Mermaid source", str(mermaid),
                     file_name="datamind-diagram.mmd", mime="text/plain",
                     key="download_mermaid_source",
                 )
-        render_cards(result.get("cards") or [], fmt)
-        table = result.get("table")
-        if isinstance(table, dict):
-            columns = table_to_columns(table)
-            if columns:
-                st.markdown("#### Generated table")
-                st.dataframe(columns, use_container_width=True, hide_index=True)
-        if not mermaid and not result.get("cards") and not result.get("table"):
-            st.info("No separate visual asset was returned for this format. See the Overview tab for the generated content.")
+        with st.expander("View the structured visual data"):
+            render_cards(result.get("cards") or [], fmt)
+            table = result.get("table")
+            if isinstance(table, dict):
+                columns = table_to_columns(table)
+                if columns:
+                    st.dataframe(columns, use_container_width=True, hide_index=True)
 
     with source_tab:
         render_source_coverage(result)
@@ -685,20 +1199,30 @@ def render_result(result: dict[str, Any]) -> None:
         st.json(result, expanded=True)
 
     st.markdown("#### Export your work")
-    exp1, exp2, exp3 = st.columns(3)
+    exp1, exp2, exp3, exp4 = st.columns(4)
     with exp1:
+        st.download_button(
+            "↓  Visual PNG", build_visual_png(
+                visual_result,
+                (st.session_state.get("last_options") or {}).get("format") or fmt,
+                (st.session_state.get("last_options") or {}).get("visual_style", "professional"),
+            ),
+            file_name="datamind-visual.png", mime="image/png",
+            use_container_width=True, key="download_result_png",
+        )
+    with exp2:
         st.download_button(
             "↓  Markdown", build_result_markdown(result),
             file_name="datamind-result.md", mime="text/markdown",
             use_container_width=True, key="download_result_markdown",
         )
-    with exp2:
+    with exp3:
         st.download_button(
             "↓  JSON", json.dumps(result, ensure_ascii=False, indent=2),
             file_name="datamind-result.json", mime="application/json",
             use_container_width=True, key="download_result_json",
         )
-    with exp3:
+    with exp4:
         if result.get("mermaid"):
             st.download_button(
                 "↓  Diagram code", str(result["mermaid"]),
