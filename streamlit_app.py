@@ -566,8 +566,10 @@ def render_cards(cards: list[Any], fmt: str) -> None:
         for index, item in enumerate(cards, 1):
             if not isinstance(item, dict):
                 continue
-            question = item.get("question") or f"Card {index}"
-            answer = item.get("answer") or "Answer not provided."
+            answer = item.get("answer") or item.get("body") or "Answer not provided."
+            question = item.get("question") or item.get("title") or ""
+            if _is_generic_item_label(question):
+                question = _derive_item_title(str(answer), index)
             with st.expander(f"{index:02d} · {question}"):
                 st.markdown(answer)
         return
@@ -579,8 +581,12 @@ def render_cards(cards: list[Any], fmt: str) -> None:
                 continue
             with column:
                 with st.container(border=True):
-                    st.markdown(f"**{item.get('title') or f'Insight {start + 1}'}**")
-                    st.markdown(str(item.get("body") or item.get("description") or item.get("content") or ""))
+                    body = str(item.get("body") or item.get("description") or item.get("content") or "")
+                    card_title = item.get("title") or item.get("label") or ""
+                    if _is_generic_item_label(card_title):
+                        card_title = _derive_item_title(body, start + 1)
+                    st.markdown(f"**{card_title or 'Key insight'}**")
+                    st.markdown(body)
 
 
 def render_source_coverage(result: dict[str, Any]) -> None:
@@ -610,9 +616,14 @@ def render_source_coverage(result: dict[str, Any]) -> None:
         st.markdown("#### Extracted source items")
         for index, item in enumerate(source_items, 1):
             if isinstance(item, dict):
-                st.markdown(f"**{index}. {item.get('label') or f'Item {index}'}**  \n{item.get('details') or ''}")
+                details = str(item.get("details") or item.get("description") or item.get("content") or "")
+                label = item.get("label") or item.get("title") or ""
+                if _is_generic_item_label(label):
+                    label = _derive_item_title(details, index)
+                st.markdown(f"**{index}. {label or 'Source insight'}**  \n{details}")
             else:
-                st.markdown(f"{index}. {item}")
+                details = str(item)
+                st.markdown(f"**{index}. {_derive_item_title(details, index)}**  \n{details}")
 
 
 def build_result_markdown(result: dict[str, Any]) -> str:
@@ -922,62 +933,160 @@ def _new_visual(title: str, fmt_label: str, palette: dict[str, str], height: int
 
 
 GENERIC_ITEM_LABEL = re.compile(
-    r"^(?:item|section|point|key\s*idea|key\s*point|insight|entry|card|element|topic)\s*#?\s*\d*\s*$",
+    r"^(?:item|section|point|key\s*idea|key\s*point|insight|entry|card|element|topic|concept)(?:\s*#?\s*\d+)?$",
+    re.IGNORECASE,
+)
+
+# These are metadata labels occasionally emitted by the API's structured
+# breakdown prompt. They describe a field, not the subject of a section.
+_METADATA_LABELS = {
+    "domain",
+    "real problem / use case",
+    "real problem/use case",
+    "problem / use case",
+    "problem/use case",
+    "ai technologies listed in source",
+    "technologies listed in source",
+    "technologies",
+    "tools and technologies",
+}
+
+_NOT_SPECIFIED = re.compile(
+    r"^(?:not separately specified(?: in (?:the )?source)?|not specified(?: in (?:the )?source)?|"
+    r"not provided|not mentioned|not available|none|n/?a|unknown)\.?$",
     re.IGNORECASE,
 )
 
 
 def _is_generic_item_label(value: Any) -> bool:
+    """Recognize plain and wrapped placeholders such as 'Item 2 (Item 2)'."""
     candidate = _clean_text(value)
-    return not candidate or bool(GENERIC_ITEM_LABEL.match(candidate))
+    candidate = re.sub(r"^\d{1,3}[.)]\s*", "", candidate)
+    candidate = re.sub(
+        r"\s*\((?:item|section|point|card|entry|topic|concept)\s*#?\s*\d+\)\s*$",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = candidate.strip(" .:—–-#")
+    return not candidate or bool(GENERIC_ITEM_LABEL.fullmatch(candidate))
+
+
+def _smart_title(value: str) -> str:
+    """Convert extracted subject text into a readable heading while preserving acronyms."""
+    value = re.sub(r"\s+", " ", str(value or "")).strip(" .:;—–-#")
+    if not value:
+        return "Source overview"
+    # If the source heading is all caps, convert it to title case.
+    if value.isupper():
+        value = value.title()
+        words = value.split()
+        minor_words = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "with"}
+        value = " ".join(word.lower() if index and word.lower() in minor_words else word for index, word in enumerate(words))
+    else:
+        value = value[0].upper() + value[1:]
+    for acronym in ("AI", "ML", "API", "PDF", "JSON", "HTML", "CSS", "SQL", "NLP", "CPU", "GPU", "IoT"):
+        value = re.sub(rf"\b{re.escape(acronym.title())}\b", acronym, value, flags=re.IGNORECASE)
+    return value[:90].rstrip(" .:;—–-")
+
+
+def _title_seed_from_block(body: str) -> str:
+    """Extract useful subject text from ordinary prose or labelled API fields."""
+    candidates: list[tuple[int, str]] = []
+    for raw in str(body or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[-*+•]\s*", "", line)
+        line = re.sub(r"^\d{1,3}[.)]\s*", "", line)
+        line = re.sub(r"^\*\*(.*?)\*\*\s*", r"\1 ", line).strip()
+        if not line:
+            continue
+
+        field = re.match(r"^([^:]{2,75}):\s*(.*)$", line)
+        if field:
+            label = _clean_text(field.group(1)).lower().strip()
+            value = _clean_text(field.group(2))
+            normalized_label = re.sub(r"\s+", " ", label)
+            if normalized_label in _METADATA_LABELS:
+                if not value or _NOT_SPECIFIED.fullmatch(value):
+                    continue
+                # The real-problem/use-case value is the best clue to the topic.
+                priority = 0 if "problem" in normalized_label or "use case" in normalized_label else 2
+                candidates.append((priority, value))
+                continue
+            if _NOT_SPECIFIED.fullmatch(value):
+                continue
+
+        # Ignore boilerplate field values even if the label was slightly different.
+        if _NOT_SPECIFIED.fullmatch(line):
+            continue
+        candidates.append((1, line))
+
+    if not candidates:
+        return _clean_text(body)
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
 
 def _derive_item_title(body: str, index: int = 1) -> str:
-    """Create a meaningful heading from content when a model returns ITEM 1/2 labels."""
-    text = _clean_text(body)
+    """Generate a meaningful heading from a section's actual subject/content."""
+    text = _title_seed_from_block(body)
     if not text:
-        return f"Concept {index}"
+        return "Source overview"
+
+    # The API sometimes prefixes its description with the actual topic in ALL CAPS:
+    # 'TYPES OF ARTIFICIAL INTELLIGENCE Narrow AI is designed...'
+    upper_prefix = re.match(
+        r"^([A-Z][A-Z0-9&/()+-]*(?:\s+[A-Z][A-Z0-9&/()+-]*){1,8}?)(?=\s+[A-Z][a-z])",
+        text,
+    )
+    if upper_prefix:
+        phrase = _smart_title(upper_prefix.group(1))
+        if len(phrase.split()) >= 2 and not _is_generic_item_label(phrase):
+            return phrase
 
     # A descriptive phrase before a colon is usually a good semantic label.
     prefix_match = re.match(r"^([^:—–]{2,58})\s*[:—–]\s*(.+)$", text)
     if prefix_match:
         candidate = prefix_match.group(1).strip(" -–—:*")
         if not _is_generic_item_label(candidate) and len(candidate.split()) <= 8:
-            return candidate[:72].strip().rstrip(".")
+            return _smart_title(candidate)
 
-    # Prefer the subject phrase before a common definition/action verb.
+    # Prefer the subject phrase before a definition/action verb.
     sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
     sentence = re.sub(r"^(?:this|these|the following|in this section)\s+", "", sentence, flags=re.I)
     subject_match = re.match(
-        r"^(.{2,65}?)\s+\b(?:is|are|refers to|means|describes|enables|allows|helps|supports|provides|uses|include|includes|consists of|works|can|could|will|should|offers|contains|represents)\b",
+        r"^(.{2,72}?)\s+\b(?:is|are|refers to|means|describes|enables|allows|helps|supports|provides|uses|include|includes|consists of|works|can|could|will|should|offers|contains|represents|plays|forms|uses)\b",
         sentence,
         re.I,
     )
     if subject_match:
         candidate = _clean_text(subject_match.group(1)).strip(" .,:;—–-")
         if candidate and not _is_generic_item_label(candidate):
-            # Add a domain-specific noun phrase when the sentence starts with a broad acronym.
+            # Expand a single broad word when the description identifies a clear domain.
+            domain_titles = [
+                (r"medical|doctor|patient|hospital|clinical|diagnos", "Healthcare Applications"),
+                (r"school|student|teacher|classroom|curriculum|learning", "Education Applications"),
+                (r"bank|transaction|fraud|payment|finance|credit", "Banking Applications"),
+                (r"vehicle|traffic|transport|route|driving|road", "Transportation Applications"),
+                (r"crop|soil|farm|irrigation|agricultur", "Agriculture Applications"),
+                (r"movie|music|video|streaming|recommend", "Personalized Recommendations"),
+            ]
             if len(candidate.split()) == 1:
-                domain_titles = [
-                    (r"medical|doctor|patient|hospital|clinical|diagnos", "Healthcare Applications"),
-                    (r"school|student|teacher|classroom|curriculum|learning", "Education Applications"),
-                    (r"bank|transaction|fraud|payment|finance|credit", "Banking Applications"),
-                    (r"vehicle|traffic|transport|route|driving|road", "Transportation Applications"),
-                    (r"crop|soil|farm|irrigation|agricultur", "Agriculture Applications"),
-                    (r"movie|music|video|streaming|recommend", "Personalized Recommendations"),
-                ]
                 for pattern, domain_title in domain_titles:
                     if re.search(pattern, text, re.I):
                         return domain_title
-            return candidate[:72]
+            return _smart_title(candidate)
 
-    # Fall back to the first meaningful words, excluding filler words.
+    # Fall back to the first informative words, not 'Concept 1' or 'Item 1'.
     stop = {
         "the", "a", "an", "this", "these", "those", "it", "they", "there", "here",
         "is", "are", "was", "were", "can", "could", "should", "would", "will", "may",
         "might", "must", "has", "have", "had", "be", "been", "being", "to", "of", "for",
         "and", "or", "but", "in", "on", "at", "by", "with", "from", "as", "that", "which",
-        "their", "its", "an", "into", "using", "use", "used", "also", "often", "many",
+        "their", "its", "into", "using", "use", "used", "also", "often", "many",
+        "domain", "problem", "real", "technologies", "listed", "source",
     }
     words = re.findall(r"[A-Za-z0-9][A-Za-z0-9&'/-]*", sentence)
     chosen: list[str] = []
@@ -985,55 +1094,100 @@ def _derive_item_title(body: str, index: int = 1) -> str:
         if word.lower() in stop:
             continue
         chosen.append(word)
-        if len(chosen) >= 4:
+        if len(chosen) >= 5:
             break
     if chosen:
-        candidate = " ".join(chosen)
-        return candidate[:72]
+        return _smart_title(" ".join(chosen))
+    return "Source overview"
 
-    return f"Concept {index}"
+
+def _placeholder_heading_parts(line: str) -> tuple[str, str] | None:
+    """Return (number, placeholder title) for '1. Item 1 (Item 1)' style lines."""
+    candidate = re.sub(r"^\s*#{1,6}\s*", "", str(line or "")).strip()
+    candidate = re.sub(r"^\s*[-*+•]\s*", "", candidate).strip()
+    candidate = re.sub(r"^\*\*(.*?)\*\*$", r"\1", candidate).strip()
+    match = re.match(r"^(?:(\d{1,3})[.)]\s+)?(.+?)\s*$", candidate)
+    if not match:
+        return None
+    number = match.group(1) or ""
+    title = match.group(2).strip().strip("*")
+    if _is_generic_item_label(title):
+        return number, title
+    return None
+
+
+def _is_next_section_boundary(line: str) -> bool:
+    candidate = str(line or "").strip()
+    if not candidate:
+        return False
+    if re.match(r"^#{1,6}\s+", candidate):
+        return True
+    if _placeholder_heading_parts(candidate):
+        return True
+    numbered = re.match(r"^\d{1,3}[.)]\s+(.+)$", candidate)
+    if numbered:
+        title = _clean_text(numbered.group(1))
+        return len(title) <= 95 and len(title.split()) <= 13 and not re.search(r"[.!?]$", title)
+    return False
 
 
 def normalize_item_labels_in_text(content: str) -> str:
-    """Replace placeholder ITEM 1/SECTION 2 headings with descriptive headings."""
+    """Replace placeholder item headings with subjects derived from their section content."""
     lines = str(content or "").splitlines()
     output: list[str] = []
-    for index, raw in enumerate(lines):
-        match = re.match(
-            r"^\s*(?:#{1,6}\s*)?(?:\*\*)?(?:item|section|point|key\s*idea|key\s*point|insight|entry|card)\s*#?\s*\d+\s*(?:\*\*)?\s*(?::|[-—–.)])?\s*(.*?)\s*$",
-            raw,
-            re.I,
-        )
-        if not match:
+    i = 0
+    section_index = 0
+
+    while i < len(lines):
+        raw = lines[i]
+        placeholder = _placeholder_heading_parts(raw)
+        if not placeholder:
+            # Remove empty metadata emitted by the analysis template; it adds no information.
+            stripped = re.sub(r"^\s*[-*+•]\s*", "", raw).strip()
+            field = re.match(r"^([^:]{2,75}):\s*(.*)$", stripped)
+            if field:
+                label = re.sub(r"\s+", " ", _clean_text(field.group(1)).lower()).strip()
+                value = _clean_text(field.group(2))
+                if label in _METADATA_LABELS and _NOT_SPECIFIED.fullmatch(value):
+                    i += 1
+                    continue
+                if label in {"real problem / use case", "real problem/use case", "problem / use case", "problem/use case"} and value:
+                    # The API often repeats the actual topic in all-caps before its explanation.
+                    active_heading = next((line for line in reversed(output) if line.strip()), "")
+                    active_heading = re.sub(r"^#{1,6}\s*", "", active_heading).strip()
+                    active_heading = re.sub(r"^\d{1,3}[.)]\s*", "", active_heading)
+                    if active_heading:
+                        value = re.sub(r"^" + re.escape(active_heading) + r"\s+", "", value, flags=re.IGNORECASE).strip()
+                    prefix = raw[:len(raw) - len(raw.lstrip())]
+                    bullet = "- " if re.match(r"^\s*[-*+•]\s*", raw) else ""
+                    output.append(f"{prefix}{bullet}{value or field.group(2)}")
+                    i += 1
+                    continue
+            # This sentence is a mechanical preface, not useful result content.
+            if _clean_text(raw).lower() in {"complete project by project breakdown", "project by project breakdown", "complete breakdown"}:
+                i += 1
+                continue
             output.append(raw)
+            i += 1
             continue
 
-        remainder = _clean_text(match.group(1))
-        next_body = ""
-        if not remainder:
-            for candidate in lines[index + 1:]:
-                if candidate.strip():
-                    next_body = _clean_text(candidate)
-                    break
-        candidate_text = remainder or next_body
-        if not candidate_text:
-            # Drop an empty placeholder rather than displaying ITEM 1 to the user.
-            continue
-
-        # A short phrase is likely already the intended heading; a sentence needs a derived title.
-        if len(candidate_text) <= 78 and not re.search(r"[.!?]$", candidate_text):
-            heading = candidate_text
-            if remainder:
-                output.append(f"### {heading}")
-            else:
-                output.append(f"### {heading}")
+        section_index += 1
+        number, _old_label = placeholder
+        block: list[str] = []
+        j = i + 1
+        while j < len(lines) and not _is_next_section_boundary(lines[j]):
+            block.append(lines[j])
+            j += 1
+        heading = _derive_item_title("\n".join(block), section_index)
+        if number:
+            output.append(f"### {number}. {heading}")
         else:
-            heading = _derive_item_title(candidate_text, len(output) + 1)
             output.append(f"### {heading}")
-            if remainder:
-                output.append(remainder)
-    return "\n".join(output)
+        i += 1
 
+    while output and not output[0].strip():
+        output.pop(0)
+    return "\n".join(output)
 
 def _parse_content_sections(content: str) -> list[dict[str, str]]:
     """Parse headings, numbered sections, bold labels and ITEM N blocks."""
@@ -1060,7 +1214,7 @@ def _parse_content_sections(content: str) -> list[dict[str, str]]:
         heading = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
         if heading:
             flush()
-            current_title = _clean_text(heading.group(1)) or "Overview"
+            current_title = re.sub(r"^\d{1,3}[.)]\s+", "", _clean_text(heading.group(1))) or "Overview"
             continue
 
         # Remove common markdown emphasis around labels before parsing.
@@ -1097,9 +1251,12 @@ def _parse_content_sections(content: str) -> list[dict[str, str]]:
         if numbered:
             candidate = _clean_text(numbered.group(2))
             is_heading = (
-                len(candidate) <= 78
-                and (candidate.isupper() or not re.search(r"[.!?]$", candidate))
-                and len(candidate.split()) <= 11
+                _is_generic_item_label(candidate)
+                or (
+                    len(candidate) <= 95
+                    and (candidate.isupper() or not re.search(r"[.!?]$", candidate))
+                    and len(candidate.split()) <= 13
+                )
             )
             flush()
             if is_heading:
@@ -1109,14 +1266,23 @@ def _parse_content_sections(content: str) -> list[dict[str, str]]:
                 current_lines.append(candidate)
             continue
 
-        # Label: explanation lines such as "Healthcare: AI can assist...".
-        colon_label = re.match(r"^(?:[-*+]\s*)?([^:]{2,58}):\s*(.+)$", normalized)
+        # Structured metadata is a field inside the current section, not a section heading.
+        colon_label = re.match(r"^(?:[-*+•]\s*)?([^:]{2,75}):\s*(.+)$", normalized)
         if colon_label:
             candidate = _clean_text(colon_label.group(1))
+            value = _clean_text(colon_label.group(2))
+            normalized_label = re.sub(r"\s+", " ", candidate.lower()).strip()
+            if normalized_label in _METADATA_LABELS:
+                if value and not _NOT_SPECIFIED.fullmatch(value):
+                    if "problem" in normalized_label or "use case" in normalized_label:
+                        current_lines.append(value)
+                    else:
+                        current_lines.append(f"{candidate}: {value}")
+                continue
             if not _is_generic_item_label(candidate) and len(candidate.split()) <= 8:
                 flush()
                 current_title = candidate
-                current_lines.append(_clean_text(colon_label.group(2)))
+                current_lines.append(value)
                 continue
 
         # Keep bullet/list text as section content, but remove visual markdown marks.
@@ -1198,7 +1364,7 @@ def _extract_visual_items(result: dict[str, Any]) -> list[dict[str, str]]:
         if _is_generic_item_label(title):
             title = _derive_item_title(body, index)
         if title or body:
-            normalized_items.append({"title": title or f"Concept {index}", "body": body})
+            normalized_items.append({"title": title or _derive_item_title(body, index), "body": body})
     return normalized_items
 
 
