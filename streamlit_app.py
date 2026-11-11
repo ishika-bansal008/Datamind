@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import math
+import os
 import re
 from io import BytesIO
 from datetime import datetime
@@ -275,10 +276,34 @@ def init_state() -> None:
         "history": [],
         "saved_projects": [],
         "dm_input_method": "Paste text",
+        "last_result_token": None,
+        "dm_editor_token": None,
+        "dm_editor_content": "",
+        "dm_editor_original_content": "",
+        "dm_content_edited": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def activate_result(result: dict[str, Any]) -> None:
+    """Set a newly generated/opened result and reset its editable text buffer."""
+    token = str(uuid4())
+    result = dict(result)
+    original = normalize_item_labels_in_text(str(result.get("content") or ""))
+    result["content"] = original
+    st.session_state.last_result = result
+    st.session_state.last_result_token = token
+    st.session_state.dm_editor_token = token
+    st.session_state.dm_editor_content = original
+    st.session_state.dm_editor_original_content = original
+    st.session_state.dm_content_edited = False
+
+
+def reset_editor_to_original() -> None:
+    """Streamlit button callback: reset the editor before widgets are rebuilt."""
+    st.session_state.dm_editor_content = st.session_state.get("dm_editor_original_content", "")
 
 
 def render_sidebar(backend_ok: bool, backend_info: Any) -> str:
@@ -609,6 +634,168 @@ def build_result_markdown(result: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def build_result_pdf(title: str, format_label: str, content: str) -> bytes:
+    """Create a readable multi-page PDF of the editable text result."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_LEFT
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import (
+            HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+        )
+    except ImportError as exc:
+        raise RuntimeError("PDF export needs ReportLab. Add reportlab to requirements.txt and redeploy.") from exc
+
+    output = BytesIO()
+    regular_name, bold_name = "Helvetica", "Helvetica-Bold"
+    font_candidates = [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
+    ]
+    for regular_path, bold_path in font_candidates:
+        try:
+            if os.path.exists(regular_path) and os.path.exists(bold_path):
+                if "DataMindUnicode" not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont("DataMindUnicode", regular_path))
+                    pdfmetrics.registerFont(TTFont("DataMindUnicode-Bold", bold_path))
+                    pdfmetrics.registerFontFamily(
+                        "DataMindUnicode", normal="DataMindUnicode",
+                        bold="DataMindUnicode-Bold", italic="DataMindUnicode",
+                        boldItalic="DataMindUnicode-Bold",
+                    )
+                regular_name, bold_name = "DataMindUnicode", "DataMindUnicode-Bold"
+                break
+        except Exception:
+            continue
+
+    doc = SimpleDocTemplate(
+        output, pagesize=A4,
+        rightMargin=19 * mm, leftMargin=19 * mm,
+        topMargin=22 * mm, bottomMargin=20 * mm,
+        title=title or "DataMind result", author="DataMind",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "DMTitle", parent=styles["Title"], fontName=bold_name,
+        fontSize=21, leading=27, textColor=colors.HexColor("#222B4A"),
+        alignment=TA_LEFT, spaceAfter=5 * mm,
+    )
+    meta_style = ParagraphStyle(
+        "DMMeta", parent=styles["Normal"], fontName=regular_name,
+        fontSize=8.5, leading=12, textColor=colors.HexColor("#68748C"),
+        spaceAfter=7 * mm,
+    )
+    body_style = ParagraphStyle(
+        "DMBody", parent=styles["BodyText"], fontName=regular_name,
+        fontSize=9.5, leading=15, textColor=colors.HexColor("#27334A"),
+        spaceAfter=3 * mm, wordWrap="CJK",
+    )
+    h1_style = ParagraphStyle(
+        "DMH1", parent=styles["Heading1"], fontName=bold_name,
+        fontSize=16, leading=20, textColor=colors.HexColor("#454DB5"),
+        spaceBefore=5 * mm, spaceAfter=2.5 * mm,
+    )
+    h2_style = ParagraphStyle(
+        "DMH2", parent=styles["Heading2"], fontName=bold_name,
+        fontSize=12.5, leading=17, textColor=colors.HexColor("#287E78"),
+        spaceBefore=4 * mm, spaceAfter=2 * mm,
+    )
+    bullet_style = ParagraphStyle(
+        "DMBullet", parent=body_style, leftIndent=5 * mm,
+        firstLineIndent=-3 * mm, spaceAfter=1.8 * mm,
+    )
+    small_style = ParagraphStyle(
+        "DMSmall", parent=body_style, fontSize=8, leading=11,
+        textColor=colors.HexColor("#68748C"),
+    )
+
+    def inline_markup(value: str) -> str:
+        safe = html.escape(value, quote=False)
+        safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe)
+        safe = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", safe)
+        safe = re.sub(r"`([^`]+)`", r"<font name='DataMindUnicode'>\1</font>" if regular_name.startswith("DataMind") else r"<font name='Helvetica'>\1</font>", safe)
+        return safe
+
+    story: list[Any] = [
+        Paragraph(html.escape(title or "DataMind Result"), title_style),
+        Paragraph(f"{html.escape(format_label)} &nbsp;·&nbsp; Generated with DataMind", meta_style),
+        HRFlowable(width="100%", thickness=1, color=colors.HexColor("#D8DEEB"), spaceAfter=5 * mm),
+    ]
+
+    lines = str(content or "No written result was returned.").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    index = 0
+    while index < len(lines):
+        raw = lines[index].strip()
+        if not raw:
+            story.append(Spacer(1, 1.2 * mm))
+            index += 1
+            continue
+
+        # Markdown tables.
+        if raw.startswith("|") and index + 1 < len(lines) and re.match(r"^\s*\|?\s*:?-{2,}", lines[index + 1]):
+            table_lines = [raw]
+            index += 1
+            if index < len(lines):
+                index += 1  # skip markdown separator row
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                table_lines.append(lines[index].strip())
+                index += 1
+            parsed = [[cell.strip() for cell in row.strip().strip("|").split("|")] for row in table_lines]
+            if parsed:
+                max_cols = max(len(row) for row in parsed)
+                data = []
+                for ridx, row in enumerate(parsed):
+                    cells = row + [""] * (max_cols - len(row))
+                    data.append([Paragraph(inline_markup(cell), small_style if ridx else bullet_style) for cell in cells])
+                table_obj = Table(data, repeatRows=1, hAlign="LEFT")
+                table_obj.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E9ECFF")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#28346A")),
+                    ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#D7DEEA")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ]))
+                story.extend([table_obj, Spacer(1, 3 * mm)])
+            continue
+
+        if raw.startswith("### "):
+            story.append(Paragraph(inline_markup(raw[4:]), h2_style))
+        elif raw.startswith("## "):
+            story.append(Paragraph(inline_markup(raw[3:]), h1_style))
+        elif raw.startswith("# "):
+            story.append(Paragraph(inline_markup(raw[2:]), h1_style))
+        elif re.match(r"^[-*+]\s+", raw):
+            item_text = re.sub(r"^[-*+]\s+", "", raw)
+            story.append(Paragraph("&bull;&nbsp; " + inline_markup(item_text), bullet_style))
+        elif re.match(r"^\d+[.)]\s+", raw):
+            story.append(Paragraph(inline_markup(raw), bullet_style))
+        else:
+            story.append(Paragraph(inline_markup(raw), body_style))
+        index += 1
+
+    def draw_page(canvas: Any, document: Any) -> None:
+        canvas.saveState()
+        page_w, page_h = A4
+        canvas.setStrokeColor(colors.HexColor("#DDE3EF"))
+        canvas.setLineWidth(0.6)
+        canvas.line(19 * mm, page_h - 14 * mm, page_w - 19 * mm, page_h - 14 * mm)
+        canvas.setFont(regular_name, 7.5)
+        canvas.setFillColor(colors.HexColor("#7A879D"))
+        canvas.drawString(19 * mm, 11 * mm, "DATAMIND  ·  TURN RAW INFORMATION INTO CLEAR UNDERSTANDING")
+        canvas.drawRightString(page_w - 19 * mm, 11 * mm, f"Page {document.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=draw_page, onLaterPages=draw_page)
+    return output.getvalue()
+
+
 
 # ============================================================================
 # VISUAL OUTPUT ENGINE
@@ -734,80 +921,285 @@ def _new_visual(title: str, fmt_label: str, palette: dict[str, str], height: int
     return image, draw
 
 
-def _extract_visual_items(result: dict[str, Any]) -> list[dict[str, str]]:
-    items: list[dict[str, str]] = []
-    cards = result.get("cards")
-    if isinstance(cards, list):
-        for index, card in enumerate(cards):
-            if isinstance(card, dict):
-                title = _clean_text(card.get("title") or card.get("question") or card.get("label") or f"Key idea {index + 1}")
-                body = _clean_text(card.get("body") or card.get("description") or card.get("content") or card.get("answer") or "")
-                if title or body:
-                    items.append({"title": title[:110], "body": body[:500]})
-            elif card:
-                items.append({"title": f"Key idea {index + 1}", "body": _clean_text(card)[:500]})
+GENERIC_ITEM_LABEL = re.compile(
+    r"^(?:item|section|point|key\s*idea|key\s*point|insight|entry|card|element|topic)\s*#?\s*\d*\s*$",
+    re.IGNORECASE,
+)
 
-    # Prefer clearly structured sections and lists from the model's markdown.
-    content = str(result.get("content") or "")
+
+def _is_generic_item_label(value: Any) -> bool:
+    candidate = _clean_text(value)
+    return not candidate or bool(GENERIC_ITEM_LABEL.match(candidate))
+
+
+def _derive_item_title(body: str, index: int = 1) -> str:
+    """Create a meaningful heading from content when a model returns ITEM 1/2 labels."""
+    text = _clean_text(body)
+    if not text:
+        return f"Concept {index}"
+
+    # A descriptive phrase before a colon is usually a good semantic label.
+    prefix_match = re.match(r"^([^:—–]{2,58})\s*[:—–]\s*(.+)$", text)
+    if prefix_match:
+        candidate = prefix_match.group(1).strip(" -–—:*")
+        if not _is_generic_item_label(candidate) and len(candidate.split()) <= 8:
+            return candidate[:72].strip().rstrip(".")
+
+    # Prefer the subject phrase before a common definition/action verb.
+    sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
+    sentence = re.sub(r"^(?:this|these|the following|in this section)\s+", "", sentence, flags=re.I)
+    subject_match = re.match(
+        r"^(.{2,65}?)\s+\b(?:is|are|refers to|means|describes|enables|allows|helps|supports|provides|uses|include|includes|consists of|works|can|could|will|should|offers|contains|represents)\b",
+        sentence,
+        re.I,
+    )
+    if subject_match:
+        candidate = _clean_text(subject_match.group(1)).strip(" .,:;—–-")
+        if candidate and not _is_generic_item_label(candidate):
+            # Add a domain-specific noun phrase when the sentence starts with a broad acronym.
+            if len(candidate.split()) == 1:
+                domain_titles = [
+                    (r"medical|doctor|patient|hospital|clinical|diagnos", "Healthcare Applications"),
+                    (r"school|student|teacher|classroom|curriculum|learning", "Education Applications"),
+                    (r"bank|transaction|fraud|payment|finance|credit", "Banking Applications"),
+                    (r"vehicle|traffic|transport|route|driving|road", "Transportation Applications"),
+                    (r"crop|soil|farm|irrigation|agricultur", "Agriculture Applications"),
+                    (r"movie|music|video|streaming|recommend", "Personalized Recommendations"),
+                ]
+                for pattern, domain_title in domain_titles:
+                    if re.search(pattern, text, re.I):
+                        return domain_title
+            return candidate[:72]
+
+    # Fall back to the first meaningful words, excluding filler words.
+    stop = {
+        "the", "a", "an", "this", "these", "those", "it", "they", "there", "here",
+        "is", "are", "was", "were", "can", "could", "should", "would", "will", "may",
+        "might", "must", "has", "have", "had", "be", "been", "being", "to", "of", "for",
+        "and", "or", "but", "in", "on", "at", "by", "with", "from", "as", "that", "which",
+        "their", "its", "an", "into", "using", "use", "used", "also", "often", "many",
+    }
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9&'/-]*", sentence)
+    chosen: list[str] = []
+    for word in words:
+        if word.lower() in stop:
+            continue
+        chosen.append(word)
+        if len(chosen) >= 4:
+            break
+    if chosen:
+        candidate = " ".join(chosen)
+        return candidate[:72]
+
+    return f"Concept {index}"
+
+
+def normalize_item_labels_in_text(content: str) -> str:
+    """Replace placeholder ITEM 1/SECTION 2 headings with descriptive headings."""
+    lines = str(content or "").splitlines()
+    output: list[str] = []
+    for index, raw in enumerate(lines):
+        match = re.match(
+            r"^\s*(?:#{1,6}\s*)?(?:\*\*)?(?:item|section|point|key\s*idea|key\s*point|insight|entry|card)\s*#?\s*\d+\s*(?:\*\*)?\s*(?::|[-—–.)])?\s*(.*?)\s*$",
+            raw,
+            re.I,
+        )
+        if not match:
+            output.append(raw)
+            continue
+
+        remainder = _clean_text(match.group(1))
+        next_body = ""
+        if not remainder:
+            for candidate in lines[index + 1:]:
+                if candidate.strip():
+                    next_body = _clean_text(candidate)
+                    break
+        candidate_text = remainder or next_body
+        if not candidate_text:
+            # Drop an empty placeholder rather than displaying ITEM 1 to the user.
+            continue
+
+        # A short phrase is likely already the intended heading; a sentence needs a derived title.
+        if len(candidate_text) <= 78 and not re.search(r"[.!?]$", candidate_text):
+            heading = candidate_text
+            if remainder:
+                output.append(f"### {heading}")
+            else:
+                output.append(f"### {heading}")
+        else:
+            heading = _derive_item_title(candidate_text, len(output) + 1)
+            output.append(f"### {heading}")
+            if remainder:
+                output.append(remainder)
+    return "\n".join(output)
+
+
+def _parse_content_sections(content: str) -> list[dict[str, str]]:
+    """Parse headings, numbered sections, bold labels and ITEM N blocks."""
     sections: list[dict[str, str]] = []
     current_title = "Overview"
     current_lines: list[str] = []
 
-    def flush_section() -> None:
+    def flush() -> None:
         nonlocal current_lines, current_title
-        text = _clean_text(" ".join(current_lines))
-        if text:
-            sections.append({"title": current_title[:110], "body": text[:650]})
+        body = _clean_text(" ".join(current_lines))
+        if body:
+            title = current_title
+            if _is_generic_item_label(title) or title.lower() == "overview":
+                title = _derive_item_title(body, len(sections) + 1)
+            sections.append({"title": title[:110], "body": body[:650]})
         current_lines = []
 
-    for raw in content.splitlines():
+    for raw in str(content or "").splitlines():
         line = raw.strip()
         if not line:
             continue
-        heading = re.match(r"^#{1,6}\s+(.+)$", line)
-        if heading:
-            flush_section()
-            current_title = _clean_text(heading.group(1)) or "Section"
-            continue
-        line = re.sub(r"^[-*+]\s+", "", line)
-        line = re.sub(r"^\d+[.)]\s+", "", line)
-        line = re.sub(r"^\*\*(.+?)\*\*\s*[:—-]\s*", r"\1: ", line)
-        cleaned = _clean_text(line)
-        if cleaned:
-            current_lines.append(cleaned)
-            # Split very long sections so visual cards stay legible.
-            if sum(len(x) for x in current_lines) > 620:
-                flush_section()
-                current_title = "Continued"
-    flush_section()
 
-    if not items:
-        items = sections
-    elif len(items) < 3 and sections:
-        seen = {x["title"].lower() for x in items}
-        for section in sections:
-            if section["title"].lower() not in seen:
-                items.append(section)
-                seen.add(section["title"].lower())
-            if len(items) >= 10:
-                break
+        # Markdown headings.
+        heading = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
+        if heading:
+            flush()
+            current_title = _clean_text(heading.group(1)) or "Overview"
+            continue
+
+        # Remove common markdown emphasis around labels before parsing.
+        normalized = re.sub(r"^\*\*(.*?)\*\*\s*", r"\1 ", line)
+        normalized = normalized.strip()
+
+        # AI outputs sometimes literally label blocks ITEM 1, ITEM 2, etc.
+        item_match = re.match(
+            r"^(?:[-*+]\s*)?(?:\*\*)?(?:item|section|point|key\s*idea|key\s*point|insight|entry|card)\s*#?\s*\d+\s*(?:\*\*)?\s*(?::|[-—–.)])?\s*(.*)$",
+            normalized,
+            re.I,
+        )
+        if item_match:
+            flush()
+            remainder = _clean_text(item_match.group(1))
+            # If the text after ITEM N is a short heading, retain it as the title.
+            if remainder and len(remainder) <= 78 and not re.search(r"[.!?]$", remainder):
+                current_title = remainder
+            else:
+                current_title = "Overview"
+                if remainder:
+                    current_lines.append(remainder)
+            continue
+
+        # Bold standalone heading, e.g. **Applications of AI**.
+        bold_heading = re.match(r"^\*\*(.+?)\*\*\s*:?\s*$", line)
+        if bold_heading:
+            flush()
+            current_title = _clean_text(bold_heading.group(1)) or "Overview"
+            continue
+
+        # Numbered heading or numbered sentence.
+        numbered = re.match(r"^(\d{1,3})[.)]\s+(.+)$", normalized)
+        if numbered:
+            candidate = _clean_text(numbered.group(2))
+            is_heading = (
+                len(candidate) <= 78
+                and (candidate.isupper() or not re.search(r"[.!?]$", candidate))
+                and len(candidate.split()) <= 11
+            )
+            flush()
+            if is_heading:
+                current_title = candidate
+            else:
+                current_title = "Overview"
+                current_lines.append(candidate)
+            continue
+
+        # Label: explanation lines such as "Healthcare: AI can assist...".
+        colon_label = re.match(r"^(?:[-*+]\s*)?([^:]{2,58}):\s*(.+)$", normalized)
+        if colon_label:
+            candidate = _clean_text(colon_label.group(1))
+            if not _is_generic_item_label(candidate) and len(candidate.split()) <= 8:
+                flush()
+                current_title = candidate
+                current_lines.append(_clean_text(colon_label.group(2)))
+                continue
+
+        # Keep bullet/list text as section content, but remove visual markdown marks.
+        normalized = re.sub(r"^[-*+]\s+", "", normalized)
+        normalized = re.sub(r"^\*\*(.+?)\*\*\s*[:—-]\s*", r"\1: ", normalized)
+        current_lines.append(_clean_text(normalized))
+
+    flush()
+    return sections[:12]
+
+
+def _extract_visual_items(result: dict[str, Any]) -> list[dict[str, str]]:
+    """Prefer meaningful labels; replace placeholder ITEM N labels with content-derived titles."""
+    content_sections = _parse_content_sections(str(result.get("content") or ""))
+    prefer_content = bool(result.get("_prefer_content", False))
+
+    cards: list[dict[str, str]] = []
+    raw_cards = result.get("cards")
+    if isinstance(raw_cards, list):
+        for index, card in enumerate(raw_cards, 1):
+            if isinstance(card, dict):
+                title = _clean_text(card.get("title") or card.get("question") or card.get("label") or "")
+                body = _clean_text(
+                    card.get("body") or card.get("description") or card.get("content")
+                    or card.get("answer") or card.get("details") or ""
+                )
+                if _is_generic_item_label(title):
+                    if not body:
+                        continue
+                    title = _derive_item_title(body, index)
+                if title or body:
+                    cards.append({"title": (title or _derive_item_title(body, index))[:110], "body": body[:500]})
+            elif card:
+                body = _clean_text(card)
+                cards.append({"title": _derive_item_title(body, index), "body": body[:500]})
+
+    # When the user has edited the written result, regenerate the visual from that text.
+    if prefer_content and content_sections:
+        items = content_sections
+    elif cards:
+        items = cards
+        if len(items) < 3 and content_sections:
+            seen = {item["title"].lower() for item in items}
+            for section in content_sections:
+                if section["title"].lower() not in seen:
+                    items.append(section)
+                    seen.add(section["title"].lower())
+                if len(items) >= 10:
+                    break
+    else:
+        items = content_sections
 
     if not items:
         important = result.get("important_lines") or []
         if isinstance(important, list):
-            items = [{"title": f"Key point {i + 1}", "body": _clean_text(line)[:500]} for i, line in enumerate(important) if _clean_text(line)]
+            for index, line in enumerate(important, 1):
+                body = _clean_text(line)
+                if body:
+                    items.append({"title": _derive_item_title(body, index), "body": body[:500]})
 
     if not items:
         words = result.get("important_words") or []
         if isinstance(words, list) and words:
-            items = [{"title": str(word), "body": "Important concept identified in the source."} for word in words[:10]]
+            items = [{"title": _clean_text(word), "body": "Important concept identified in the source."} for word in words[:10]]
 
     if not items:
         source = _clean_text(result.get("source_text") or result.get("content") or "No structured details were returned.")
         sentences = re.split(r"(?<=[.!?])\s+", source)
-        items = [{"title": f"Key idea {i + 1}", "body": sentence[:500]} for i, sentence in enumerate(sentences[:8]) if sentence]
+        items = [
+            {"title": _derive_item_title(sentence, index), "body": sentence[:500]}
+            for index, sentence in enumerate(sentences[:8], 1) if sentence
+        ]
 
-    return items[:12]
+    # One final guard: never expose generic ITEM/SECTION placeholders in the visual labels.
+    normalized_items: list[dict[str, str]] = []
+    for index, item in enumerate(items[:12], 1):
+        title = _clean_text(item.get("title", ""))
+        body = _clean_text(item.get("body", ""))
+        if _is_generic_item_label(title):
+            title = _derive_item_title(body, index)
+        if title or body:
+            normalized_items.append({"title": title or f"Concept {index}", "body": body})
+    return normalized_items
 
 
 def _extract_flow_nodes(result: dict[str, Any], items: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -908,7 +1300,7 @@ def _draw_timeline(title: str, fmt: str, items: list[dict[str, str]], palette: d
         draw.ellipse((x_line - 20, y + 22, x_line + 20, y + 62), fill=accent, outline=palette["white"], width=2)
         _rounded_card(draw, (300, y, 1390, y + 112), palette, accent)
         date_match = re.search(r"\b(\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b", item["title"], re.I)
-        label = date_match.group(0) if date_match else f"MILESTONE {i + 1:02d}"
+        label = date_match.group(0) if date_match else f"{i + 1:02d}"
         draw.text((330, y + 17), label.upper(), font=_font(15, True), fill=accent)
         draw.text((550, y + 15), item["title"][:62], font=_font(22, True), fill=palette["text"])
         if item.get("body"):
@@ -1003,10 +1395,9 @@ def _draw_editorial(title: str, fmt: str, items: list[dict[str, str]], palette: 
         y = 285 + row * 220
         accent = palette["accent"] if i % 2 == 0 else palette["accent2"]
         _rounded_card(draw, (x, y, x + 680, y + 188), palette, accent)
-        draw.text((x + 28, y + 20), f"SECTION {i + 1:02d}", font=_font(14, True), fill=accent)
-        _draw_wrapped(draw, (x + 28, y + 53), item["title"], _font(23, True), palette["text"], 620, 5, 2)
+        _draw_wrapped(draw, (x + 28, y + 26), item["title"], _font(23, True), palette["text"], 620, 5, 2)
         if item.get("body"):
-            _draw_wrapped(draw, (x + 28, y + 100), item["body"], _font(16), palette["muted"], 620, 5, 4)
+            _draw_wrapped(draw, (x + 28, y + 76), item["body"], _font(16), palette["muted"], 620, 5, 5)
     return image
 
 
@@ -1104,6 +1495,25 @@ def render_result(result: dict[str, Any]) -> None:
         (name for name, value in FORMATS.items() if value["id"] == fmt),
         fmt.replace("_", " ").title(),
     )
+
+    # Keep an editable buffer tied to the currently active result.
+    active_token = st.session_state.get("last_result_token")
+    if not active_token:
+        active_token = str(uuid4())
+        st.session_state.last_result_token = active_token
+    if st.session_state.get("dm_editor_token") != active_token:
+        original_content = str(result.get("content") or "")
+        st.session_state.dm_editor_token = active_token
+        st.session_state.dm_editor_content = original_content
+        st.session_state.dm_editor_original_content = original_content
+        st.session_state.dm_content_edited = False
+
+    edited_content = str(st.session_state.get("dm_editor_content", result.get("content") or ""))
+    display_result = dict(result)
+    display_result["content"] = edited_content
+    if st.session_state.get("dm_content_edited"):
+        display_result["_prefer_content"] = True
+
     is_fallback = result.get("mode") in {"demo", "demo-fallback"}
     status_tag = (
         '<span class="dm-fallback-tag">DEMO / FALLBACK</span>'
@@ -1136,19 +1546,87 @@ def render_result(result: dict[str, Any]) -> None:
         )
         st.markdown(f"<div style='margin:9px 0 14px'>{tags}</div>", unsafe_allow_html=True)
 
-    visual_result = dict(result)
+    visual_result = dict(display_result)
     visual_result.setdefault("source_text", st.session_state.get("last_source_text", ""))
+    if st.session_state.get("dm_content_edited"):
+        # The edited text becomes the source of truth for the regenerated visual.
+        visual_result["cards"] = []
+        visual_result["table"] = None
+        visual_result["_prefer_content"] = True
 
-    overview_tab, visual_tab, source_tab, raw_tab = st.tabs(
-        ["✦  Overview", "▧  Visual output", "◫  Source & coverage", "{}  Raw data"]
+    overview_tab, edit_tab, visual_tab, source_tab, raw_tab = st.tabs(
+        ["✦  Overview", "✎  Edit text & PDF", "▧  Visual output", "◫  Source & coverage", "{}  Raw data"]
     )
     with overview_tab:
-        st.markdown(str(result.get("content") or "No written explanation was returned."))
+        st.markdown(edited_content or "No written explanation was returned.")
         important_lines = result.get("important_lines") or []
         if important_lines:
             with st.expander("Important lines from the original source"):
                 for line in important_lines:
                     st.markdown(f"- {line}")
+
+    with edit_tab:
+        st.markdown("#### Make the result yours")
+        st.caption("Edit the generated explanation below. Apply your changes to update the overview and visual output, or download the current draft as a PDF.")
+        current_edit = st.text_area(
+            "Editable result text",
+            key="dm_editor_content",
+            height=390,
+            label_visibility="collapsed",
+            placeholder="Your generated result will appear here. Edit headings, explanations, examples or wording…",
+        )
+        # Compare against the currently applied result, not the first AI draft.
+        changed = current_edit != str(result.get("content") or "")
+        edit_col, reset_col, edit_status_col = st.columns([1.25, 1.0, 2.2], vertical_alignment="center")
+        with edit_col:
+            apply_edits = st.button(
+                "✓  Apply text changes", type="primary", use_container_width=True,
+                disabled=not changed, key="dm_apply_text_edits",
+            )
+        with reset_col:
+            st.button(
+                "Reset original", use_container_width=True,
+                disabled=not changed, key="dm_reset_text_edits",
+                on_click=reset_editor_to_original,
+            )
+        with edit_status_col:
+            st.caption("Unsaved edits" if changed else "Text is up to date")
+
+        if apply_edits:
+            updated_result = dict(result)
+            updated_result["content"] = current_edit
+            st.session_state.last_result = updated_result
+            st.session_state.dm_editor_content = current_edit
+            st.session_state.dm_content_edited = True
+            # Preserve the edited copy in the in-session history as a new revision.
+            add_to_history(
+                updated_result,
+                st.session_state.get("last_source_text", ""),
+                st.session_state.get("last_options") or {},
+            )
+            st.success("Your edits are applied. The Overview and Visual Output now use your updated text.")
+            st.rerun()
+
+        pdf_col, md_col, hint_col = st.columns([1.15, 1.15, 2.2], vertical_alignment="center")
+        slug = re.sub(r"[^a-z0-9]+", "-", str(result.get("title") or "datamind-result").lower()).strip("-")[:48] or "datamind-result"
+        with pdf_col:
+            try:
+                pdf_bytes = build_result_pdf(str(result.get("title") or "DataMind result"), label, current_edit)
+                st.download_button(
+                    "↓  Download text as PDF", pdf_bytes,
+                    file_name=f"{slug}.pdf", mime="application/pdf",
+                    use_container_width=True, key="dm_download_editable_pdf",
+                )
+            except Exception as exc:
+                st.error(f"PDF export failed: {exc}")
+        with md_col:
+            st.download_button(
+                "↓  Download text", current_edit,
+                file_name=f"{slug}.txt", mime="text/plain",
+                use_container_width=True, key="dm_download_editable_txt",
+            )
+        with hint_col:
+            st.caption("PDF export includes the text currently visible in this editor, including edits not yet applied.")
 
     with visual_tab:
         selected_options = st.session_state.get("last_options") or {}
@@ -1157,7 +1635,7 @@ def render_result(result: dict[str, Any]) -> None:
         try:
             visual_png = build_visual_png(visual_result, selected_format, selected_visual_style)
             st.markdown("#### Your generated visual")
-            st.caption("DataMind has converted the AI result into a format-specific image. Preview it here and download the full-resolution PNG.")
+            st.caption("The visual is generated from your structured result. Apply text edits to refresh the visual using your updated wording.")
             st.image(visual_png, use_container_width=True)
             slug = re.sub(r"[^a-z0-9]+", "-", str(result.get("title") or label).lower()).strip("-")[:48] or "visual"
             st.download_button(
@@ -1196,10 +1674,11 @@ def render_result(result: dict[str, Any]) -> None:
             st.caption("No separate source-register metadata was returned for this result.")
 
     with raw_tab:
-        st.json(result, expanded=True)
+        st.json(display_result, expanded=True)
 
     st.markdown("#### Export your work")
-    exp1, exp2, exp3, exp4 = st.columns(4)
+    exp1, exp2, exp3, exp4, exp5 = st.columns(5)
+    result_slug = re.sub(r"[^a-z0-9]+", "-", str(result.get("title") or "datamind-result").lower()).strip("-")[:48] or "datamind-result"
     with exp1:
         st.download_button(
             "↓  Visual PNG", build_visual_png(
@@ -1207,26 +1686,32 @@ def render_result(result: dict[str, Any]) -> None:
                 (st.session_state.get("last_options") or {}).get("format") or fmt,
                 (st.session_state.get("last_options") or {}).get("visual_style", "professional"),
             ),
-            file_name="datamind-visual.png", mime="image/png",
+            file_name=f"{result_slug}-visual.png", mime="image/png",
             use_container_width=True, key="download_result_png",
         )
     with exp2:
         st.download_button(
-            "↓  Markdown", build_result_markdown(result),
-            file_name="datamind-result.md", mime="text/markdown",
-            use_container_width=True, key="download_result_markdown",
+            "↓  Text PDF", build_result_pdf(str(result.get("title") or "DataMind result"), label, edited_content),
+            file_name=f"{result_slug}.pdf", mime="application/pdf",
+            use_container_width=True, key="download_result_pdf",
         )
     with exp3:
         st.download_button(
-            "↓  JSON", json.dumps(result, ensure_ascii=False, indent=2),
-            file_name="datamind-result.json", mime="application/json",
-            use_container_width=True, key="download_result_json",
+            "↓  Markdown", build_result_markdown(display_result),
+            file_name=f"{result_slug}.md", mime="text/markdown",
+            use_container_width=True, key="download_result_markdown",
         )
     with exp4:
+        st.download_button(
+            "↓  JSON", json.dumps(display_result, ensure_ascii=False, indent=2),
+            file_name=f"{result_slug}.json", mime="application/json",
+            use_container_width=True, key="download_result_json",
+        )
+    with exp5:
         if result.get("mermaid"):
             st.download_button(
                 "↓  Diagram code", str(result["mermaid"]),
-                file_name="datamind-diagram.mmd", mime="text/plain",
+                file_name=f"{result_slug}.mmd", mime="text/plain",
                 use_container_width=True, key="download_result_diagram",
             )
         else:
@@ -1331,7 +1816,7 @@ def render_create_page(backend_ok: bool) -> None:
                         if uploaded_file is not None
                         else run_text_transform(source_text, options)
                     )
-                st.session_state.last_result = result
+                activate_result(result)
                 st.session_state.last_options = options.copy()
                 st.session_state.last_source_text = result.get("source_text") or source_text or ""
                 add_to_history(result, st.session_state.last_source_text, options)
@@ -1375,7 +1860,7 @@ def render_create_page(backend_ok: bool) -> None:
                             previous_options.get("language", "English"),
                             previous_options.get("complexity", "beginner"),
                         )
-                    st.session_state.last_result = updated
+                    activate_result(updated)
                     add_to_history(
                         updated,
                         st.session_state.get("last_source_text", ""),
@@ -1452,7 +1937,7 @@ def render_library_page(page: str) -> None:
                 )
             with action_col:
                 if st.button("Open result", key=f"dm_open_{page}_{index}", use_container_width=True):
-                    st.session_state.last_result = item.get("result")
+                    activate_result(item.get("result") or {})
                     st.session_state.last_source_text = item.get("source", "")
                     st.session_state.last_options = item.get("options", {})
                     st.session_state.page = "Create"
